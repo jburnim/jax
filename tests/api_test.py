@@ -18,6 +18,7 @@ from __future__ import print_function
 
 import collections
 import copy
+import contextlib
 from functools import partial
 import unittest
 import warnings
@@ -25,6 +26,7 @@ import weakref
 
 from absl import logging
 from absl.testing import absltest
+from absl.testing import parameterized
 import numpy as onp
 import six
 
@@ -34,7 +36,7 @@ if six.PY3:
 import jax
 import jax.numpy as np
 from jax import jit, grad, device_put, jacfwd, jacrev, hessian
-from jax import api, lax
+from jax import api, lax, lax_reference
 from jax.core import Primitive
 from jax.interpreters import ad
 from jax.interpreters import xla
@@ -1310,7 +1312,7 @@ class APITest(jtu.JaxTestCase):
     python_should_be_executing = False
     api.pmap(f, 'i')(x)
 
-  def test_repr(self):
+  def test_device_array_repr(self):
     rep = repr(np.ones(()) + 1.)
     self.assertStartsWith(rep, 'DeviceArray')
 
@@ -1642,6 +1644,210 @@ class JaxprTest(jtu.JaxTestCase):
                     true_nconsts=1 ] b a c a d
       in [e] }
         """)
+
+
+class JaxprTest(jtu.JaxTestCase):
+
+  def test_scalar_literals(self):
+    jaxpr = api.make_jaxpr(lambda x: x + 2)(42)
+    self.assertLen(jaxpr.jaxpr.constvars, 0)
+
+  def test_const(self):
+    def fun(x):
+      return (x, 1., np.zeros(1))
+
+    jaxpr = api.make_jaxpr(fun)(0.)
+    self.assertMultiLineStrippedEqual(str(jaxpr), """
+    { lambda b ;  ; a.
+        let
+        in [a, 1.0, b] }
+    """)
+
+  def test_cond(self):
+    def f(x):
+      return lax.cond(x >= 0.,
+                      x + 1.,
+                      lambda xt: xt + x,
+                      x + 2.,
+                      lambda xf: xf - x)
+    jaxpr = api.make_jaxpr(f)(3.)
+    self.assertMultiLineStrippedEqual(str(jaxpr), """
+    { lambda  ;  ; a.
+      let b = ge a 0.0
+          c = add a 1.0
+          d = add a 2.0
+          e = cond[ false_jaxpr={ lambda  ;  ; b a.
+                                  let c = sub a b
+                                  in [c] }
+                    false_nconsts=1
+                    true_jaxpr={ lambda  ;  ; b a.
+                                 let c = add a b
+                                 in [c] }
+                    true_nconsts=1 ] b a c a d
+      in [e] }
+        """)
+
+
+class LazyTest(jtu.JaxTestCase):
+
+  @contextlib.contextmanager
+  def _check_num_eager_computations(self, num):
+    xla_primitive_callable = xla.xla_primitive_callable
+    count = [0]
+    def primitive_callable_and_count(*args, **kwargs):
+      count[0] += 1
+      return xla_primitive_callable(*args, **kwargs)
+    try:
+      xla.xla_primitive_callable = primitive_callable_and_count
+      yield
+    finally:
+      xla.xla_primitive_callable = xla_primitive_callable
+    self.assertEqual(count[0], num)
+
+  def test_lazy_reshape_multiply(self):
+    a = np.array([1, 2, 3], dtype=onp.int32)
+    with self._check_num_eager_computations(1):
+      x = a[:, None] * a[None, :]
+    expected = onp.outer([1, 2, 3], [1, 2, 3])
+    self.assertAllClose(x, expected, check_dtypes=False)
+
+  @parameterized.named_parameters(
+      ("int32", onp.int32),
+      ("float32", onp.float32),
+  )
+  def test_lazy_iota_broadcast_add(self, dtype):
+    with self._check_num_eager_computations(1):
+      a = np.arange(3, dtype=dtype)
+      assert xla.is_device_constant(a)
+      y = np.broadcast_to(a, (5, 3))
+      z = y + onp.array(5, dtype=dtype)
+    expected = (onp.broadcast_to(onp.arange(3, dtype=dtype), (5, 3))
+                + onp.array(5, dtype=dtype))
+    self.assertAllClose(z, expected, check_dtypes=True)
+
+  @parameterized.named_parameters(
+      ("int32", onp.int32),
+      ("float32", onp.float32),
+  )
+  def test_lazy_eye(self, dtype):
+    with self._check_num_eager_computations(1):
+      z = np.eye(3, dtype=dtype) + onp.array(5, dtype=dtype)
+    expected = onp.eye(3, dtype=dtype) + onp.array(5, dtype=dtype)
+    self.assertAllClose(z, expected, check_dtypes=True)
+
+  def test_lazy_jit_closed_over_values(self):
+    y = np.arange(int(1e12))  # will likely oom if materialized
+    ans = jit(lambda x: (x + y)[1])(1)
+    self.assertEqual(ans, 2)
+
+  def test_jit_forces_arguments(self):
+
+    @api.jit
+    def f(x):
+      assert python_should_be_executing
+      return np.sum(x)
+
+    x = np.arange(10, dtype=np.int32)
+    assert xla.is_device_constant(x)  # lazy iota
+
+    python_should_be_executing = True
+    _ = f(x)
+
+    python_should_be_executing = False  # should not recompile
+    x = onp.arange(10, dtype=onp.int32)
+    _ = f(x)
+
+  @parameterized.parameters(jtu.cases_from_list(range(10000)))
+  def test_random_lazy_program(self, seed):
+
+    def random_array(rng):
+      kind = rng.choice(['arr', 'iota', 'eye', 'tri'])
+      if kind == 'arr':
+        dtype = [onp.float32, onp.int32][rng.choice(2)]
+        dim = rng.randint(4)
+        shape = rng.randint(4, size=dim)
+        onp_x = onp.asarray(rng.randn(*shape), dtype=dtype)
+        jax_x = np.array(onp_x, dtype=dtype)
+      elif kind == 'iota':
+        dtype = [onp.float32, onp.int32][rng.choice(2)]
+        size = rng.randint(5)
+        onp_x = onp.arange(size, dtype=dtype)
+        with self._check_num_eager_computations(0):
+          jax_x = lax.iota(dtype, size)
+      elif kind == 'eye':
+        dtype = [onp.float32, onp.int32][rng.choice(2)]
+        N = rng.randint(2, 5)
+        M = None if rng.rand() < 0.5 else rng.randint(2, 5)
+        k = rng.choice([-1, 0, 1])
+        onp_x = onp.eye(N, M, k, dtype=dtype)
+        with self._check_num_eager_computations(0):
+          jax_x = np.eye(N, M, k, dtype=dtype)
+      elif kind == 'tri':
+        dtype = [onp.float32, onp.int32][rng.choice(2)]
+        N = rng.randint(2, 5)
+        M = None if rng.rand() < 0.5 else rng.randint(2, 5)
+        k = rng.choice([-1, 0, 1])
+        onp_x = onp.tri(N, M, k, dtype=dtype)
+        with self._check_num_eager_computations(0):
+          jax_x = np.tri(N, M, k, dtype=dtype)
+      else:
+        assert False
+      assert type(onp_x) is onp.ndarray and type(jax_x) is xla.DeviceArray
+      return onp_x, jax_x
+
+    def random_op(rng, shape):
+      kind = rng.choice(['transpose', 'broadcast', 'reshape'])
+      if kind == 'transpose':
+        perm = tuple(rng.permutation(len(shape)))
+        return Op(partial(onp.transpose, axes=perm),
+                  partial(lax.transpose, permutation=perm))
+      elif kind == 'broadcast':
+        n = rng.randint(1, 3)
+        new_sizes = rng.randint(1, 4, size=n)
+        new_ndim  = n + len(shape)
+        bcast_dims = tuple(sorted(rng.permutation(new_ndim)[:len(shape)]))
+        shape_iter = iter(shape)
+        new_sizes = iter(rng.randint(1, 4, size=n))
+        new_shape = [next(shape_iter) if i in  bcast_dims else next(new_sizes)
+                    for i in range(new_ndim)]
+        return Op(partial(lax_reference.broadcast_in_dim, shape=new_shape,
+                          broadcast_dimensions=bcast_dims),
+                  partial(lax.broadcast_in_dim, shape=new_shape,
+                          broadcast_dimensions=bcast_dims))
+      elif kind == 'reshape':
+        new_shape = list(shape)
+        for _ in range(rng.randint(1, 3)):
+          loc = len(new_shape) and rng.randint(len(new_shape))
+          new_shape.insert(loc, 1)
+        new_shape = tuple(new_shape)
+        return Op(partial(onp.reshape, newshape=new_shape),
+                  partial(lax.reshape, new_sizes=new_shape))
+      else:
+        assert False
+    Op = collections.namedtuple('Op', ['onp_fn', 'jax_fn'])
+
+    rng = onp.random.RandomState(seed)
+    onp_x, jax_x = random_array(rng)
+    with self._check_num_eager_computations(0):
+      for _ in range(rng.randint(5)):
+        op = random_op(rng, onp.shape(onp_x))
+        onp_x = op.onp_fn(onp_x)
+        jax_x = op.jax_fn(jax_x)
+
+    kind = rng.choice(['closure', 'npy_value', 'force', 'add'])
+    if kind == 'closure':
+      result = api.jit(lambda x: x + jax_x)(0)
+      self.assertAllClose(onp_x, result, check_dtypes=False)
+    elif kind == 'npy_value':
+      self.assertAllClose(onp_x, jax_x, check_dtypes=False)
+    elif kind == 'force':
+      result = xla._force(jax_x)
+      self.assertAllClose(onp_x, result, check_dtypes=False)
+    elif kind == 'add':
+      result = jax_x + onp.zeros(jax_x.shape, dtype=jax_x.dtype)
+      self.assertAllClose(onp_x, result, check_dtypes=False)
+    else:
+      assert False
 
 
 if __name__ == '__main__':

@@ -19,6 +19,7 @@ from __future__ import print_function
 import collections
 import functools
 import itertools as it
+import operator as op
 import types
 
 import fastcache
@@ -219,3 +220,22 @@ def get_module_functions(module):
         attr, (types.BuiltinFunctionType, types.FunctionType, onp.ufunc)):
       module_fns.add(attr)
   return module_fns
+
+def subvals(lst, replace):
+  """Substitute new values in a list based on (index, newval) pairs."""
+  lst = list(lst)
+  for i, v in replace:
+    lst[i] = v
+  return tuple(lst)
+
+# TODO(mattjj): replace with dataclass when Python 2 support is removed
+def taggedtuple(name, fields):
+  """Lightweight version of namedtuple where equality depends on the type."""
+  def __new__(cls, *xs):
+    return tuple.__new__(cls, (cls,) + xs)
+  def __repr__(self):
+    return '{}{}'.format(name, tuple.__repr__(self[1:]))
+  class_namespace = {'__new__' : __new__, '__repr__': __repr__}
+  for i, f in enumerate(fields):
+    class_namespace[f] = property(op.itemgetter(i+1))
+  return type(name, (tuple,), class_namespace)
