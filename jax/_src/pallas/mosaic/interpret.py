@@ -33,6 +33,7 @@ from jax._src.state import primitives as state_primitives
 from jax._src.util import (
     safe_map,
     safe_zip,
+    split_list
 )
 import jax.numpy as jnp
 import numpy as np
@@ -315,6 +316,36 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params):
     if prim is primitives.load_p:
       raise NotImplementedError()
 
+    elif prim is lax.cond_p:
+      out = lax.switch(
+        invals[0],
+        [lambda *args: _interpret_jaxpr(branch_jaxpr.jaxpr, *args,
+                                        compiler_params=compiler_params)
+         for branch_jaxpr in eqn.params['branches']],
+        *invals[1:])
+
+    elif prim is lax.scan_p:
+      consts, init_carry, xs = split_list(
+        invals, [eqn.params['num_consts'], eqn.params['num_carry']])
+      def _scan_body(c, a):
+        return split_list(
+          _interpret_jaxpr(eqn.params['jaxpr'].jaxpr, *consts, *c, *a,
+                           compiler_params=compiler_params),
+          [eqn.params['num_carry']])
+      out = lax.scan(_scan_body, init_carry, xs)
+
+    elif prim is lax.while_p:
+      cond_consts, body_consts, init_vals  = split_list(
+        invals, [eqn.params['cond_nconsts'], eqn.params['body_nconsts']])
+      out = lax.while_loop(
+        lambda args: _interpret_jaxpr(eqn.params['cond_jaxpr'].jaxpr,
+                                       *cond_consts, *args,
+                                       compiler_params=compiler_params)[0],
+        lambda args: _interpret_jaxpr(eqn.params['body_jaxpr'].jaxpr,
+                                       *body_consts, *args,
+                                       compiler_params=compiler_params),
+        init_vals)
+
     elif prim is state_primitives.get_p:
       out = callback.io_callback(
         get,
@@ -414,6 +445,8 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params):
 
     out = out if prim.multiple_results else [out]
     jax.util.safe_map(write, eqn.outvars, out)
+
+  return jax.util.safe_map(read, jaxpr.outvars)
 
 def _initialize_scratch_vals(scratch_avals) -> tuple[jax.Array, ...]:
   scratch_avals = (jax_core.raise_to_shaped(x) for x in scratch_avals)
