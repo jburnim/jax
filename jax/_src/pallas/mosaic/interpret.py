@@ -15,6 +15,7 @@
 import collections
 from collections.abc import Iterable, Sequence
 import dataclasses
+from functools import reduce
 import itertools
 import math
 import threading
@@ -29,10 +30,12 @@ from jax._src.pallas.mosaic import core as mosaic_core
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas import primitives
 from jax._src.state import discharge as state_discharge
+from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
 from jax._src.util import (
     safe_map,
     safe_zip,
+    split_list
 )
 import jax.numpy as jnp
 import numpy as np
@@ -155,6 +158,10 @@ def transform_array(x, transforms):
   return x
 
 def get(device_id, memory_space, buffer_id, transforms):
+  # NOTE: buffer_id is a pair of an int ID and a tuple of transforms
+  # TODO(jburnim): Clean this up.
+  buffer_id, transforms = buffer_id[0], buffer_id[1] + transforms
+
   device_id = tuple(int(x) for x in device_id)
   memory_space = TPU_MEMORY_SPACE_NAMES[int(memory_space)]
   buffer_id = int(buffer_id)
@@ -165,6 +172,9 @@ def get(device_id, memory_space, buffer_id, transforms):
     ).copy()
 
 def store(device_id, memory_space, buffer_id, transforms, val):
+  # NOTE: buffer_id is a pair of an int ID and a tuple of transforms.
+  buffer_id, transforms = buffer_id[0], buffer_id[1] + transforms
+
   device_id = tuple(int(x) for x in device_id)
   memory_space = TPU_MEMORY_SPACE_NAMES[int(memory_space)]
   buffer_id = int(buffer_id)
@@ -179,6 +189,9 @@ def store(device_id, memory_space, buffer_id, transforms, val):
       shared_memory.mem[(memory_space, buffer_id, device_id)] = val
 
 def swap(device_id, memory_space, buffer_id, transforms, val):
+  # NOTE: buffer_id is a pair of an int ID and a tuple of transforms.
+  buffer_id, transforms = buffer_id[0], buffer_id[1] + transforms
+
   device_id = tuple(int(x) for x in device_id)
   memory_space = TPU_MEMORY_SPACE_NAMES[int(memory_space)]
   buffer_id = int(buffer_id)
@@ -187,28 +200,29 @@ def swap(device_id, memory_space, buffer_id, transforms, val):
 
   with shared_memory.lock:
     mem_val = shared_memory.mem[(memory_space, buffer_id, device_id)].copy()
-  # TODO(jburnim): Do this transform with NumPy arrays.
+  # TODO(jburnim): Do this transform with NumPy arrays?
   result, result_val = state_discharge.transform_swap_array(
-      mem_val, transforms, val)
+      jnp.array(mem_val), transforms, jnp.array(val))
   result_val = np.array(result_val)
   with shared_memory.lock:
     shared_memory.mem[(memory_space, buffer_id, device_id)] = result_val
+
   return np.array(result)
 
 def execute_dma(src, dst, send_sem, recv_sem):
-    # Do the read.
-    data = get(*src)
-    data_size = data.itemsize * data.size
+  # Do the read.
+  data = get(*src)
+  data_size = data.itemsize * data.size
 
-    # Signal the send semaphore.
-    if send_sem is not None:
-      send_sem.signal(data_size, device_id=src[0])
+  # Signal the send semaphore.
+  if send_sem is not None:
+    send_sem.signal(data_size, device_id=src[0])
 
-    # Do the write.
-    store(*dst, data)
+  # Do the write.
+  store(*dst, data)
 
-    # Signal the receive semaphore.
-    recv_sem.signal(data_size, device_id=dst[0])
+  # Signal the receive semaphore.
+  recv_sem.signal(data_size, device_id=dst[0])
 
 def print_memory(device_id):
   device_id = tuple(map(int, device_id))
@@ -221,14 +235,22 @@ def dma_start(device_id, src_memory_space, src_id, src_transforms,
               dst_sem,
               src_sem,
               dst_device_id):
+  # NOTE: src_id and dst_id are pairs of int IDs and tuples of transforms.
+  src_id, src_transforms = src_id[0], src_id[1] + src_transforms
+  dst_id, dst_transforms = dst_id[0], dst_id[1] + dst_transforms
+
   device_id = tuple(int(x) for x in device_id)
   src_memory_space, src_id = int(src_memory_space), int(src_id)
   src_transforms = jax.tree.map(int, src_transforms)
   dst_memory_space, dst_id = int(dst_memory_space), int(dst_id)
   dst_transforms = jax.tree.map(int, dst_transforms)
   dst_sem = int(dst_sem)
-  src_sem = int(src_sem)
-  dst_device_id = tuple(int(x) for x in dst_device_id)
+  if src_sem is not None:
+    src_sem = int(src_sem)
+  if dst_device_id is not None:
+    dst_device_id = tuple(int(x) for x in dst_device_id)
+  else:
+    dst_device_id = device_id
 
   with shared_memory.lock:
     dst_sem = shared_memory.sem[dst_sem]
@@ -238,8 +260,8 @@ def dma_start(device_id, src_memory_space, src_id, src_transforms,
   # For now, just execute the DMA immediately.
   # TODO(jburnim): Execute DMAs asynchronously.
   execute_dma(
-      (device_id, src_memory_space, src_id, src_transforms),
-      (dst_device_id, dst_memory_space, dst_id, dst_transforms),
+      (device_id, src_memory_space, (src_id, ()), src_transforms),
+      (dst_device_id, dst_memory_space, (dst_id, ()), dst_transforms),
       src_sem,
       dst_sem)
 
@@ -295,7 +317,7 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params):
   def write(var, value):
     env[var] = value
 
-  jax.util.safe_map(write, jaxpr.invars, args)
+  jax.util.safe_map(write, jaxpr.constvars + jaxpr.invars, args)
 
   # Get the mesh coordinates.
   device_coords = tuple(
@@ -303,17 +325,90 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params):
   # TODO(jburnim): Convert to a single integer device ID?
 
   # TODO(jburnim): Clean up and finish this evaluation loop.  For example:
-  #  - Handle cond, scan, and while.
-  #  - Handle other higher-order primitives.
-  #  - Handle missing Pallas primitives, like masked_load, program_id,
-  #    num_programs, ...
+  #  - Handle missing Pallas primitives, like masked_load.
   #  - Replace the big if-statement with a dictionary of rules.
+  #  - Handle other higher-order primitives?
+  #  - Megacore.
   for eqn in jaxpr.eqns:
     prim = eqn.primitive
     invals = jax.util.safe_map(read, eqn.invars)
 
     if prim is primitives.load_p:
       raise NotImplementedError()
+
+    elif prim is lax.cond_p:
+      def _make_branch(jaxpr):
+        return lambda *args: _interpret_jaxpr(
+            jaxpr, *args, compiler_params=compiler_params)
+      out = lax.switch(
+        invals[0],
+        [_make_branch(branch_jaxpr.jaxpr)
+         for branch_jaxpr in eqn.params['branches']],
+        *invals[1:])
+
+    elif prim is lax.scan_p:
+      consts, init_carry, xs = split_list(
+        invals, [eqn.params['num_consts'], eqn.params['num_carry']])
+      def _scan_body(c, a):
+        return split_list(
+          _interpret_jaxpr(eqn.params['jaxpr'].jaxpr, *consts, *c, *a,
+                           compiler_params=compiler_params),
+          [eqn.params['num_carry']])
+      out = lax.scan(_scan_body, init_carry, xs)
+
+    elif prim is lax.while_p:
+      cond_consts, body_consts, init_vals  = split_list(
+        invals, [eqn.params['cond_nconsts'], eqn.params['body_nconsts']])
+      out = lax.while_loop(
+        lambda args: _interpret_jaxpr(eqn.params['cond_jaxpr'].jaxpr,
+                                       *cond_consts, *args,
+                                       compiler_params=compiler_params)[0],
+        lambda args: _interpret_jaxpr(eqn.params['body_jaxpr'].jaxpr,
+                                       *body_consts, *args,
+                                       compiler_params=compiler_params),
+        init_vals)
+
+    elif prim is primitives.run_scoped_p:
+      # Allocate a buffer or semaphore for each element of
+      # eqn.params['jaxpr'].invars .
+      allocs = []
+      for v in eqn.params['jaxpr'].invars:
+        if v.aval.memory_space.value == 'semaphore_mem':
+          allocs.append(callback.io_callback(
+            _allocate_semaphore,
+            jax.ShapeDtypeStruct(v.aval.shape, jnp.int16),
+            device_coords,
+            v.aval.shape,
+            ordered=True))
+        else:
+          allocs.append((callback.io_callback(
+            _allocate_buffer,
+            jax.ShapeDtypeStruct((), jnp.int16),
+            device_coords,
+            TPU_MEMORY_SPACE_IDXS[v.aval.memory_space],
+            primitives.uninitialized_value(v.aval.shape, v.aval.dtype),
+            ordered=True), ()))
+
+      out = _interpret_jaxpr(eqn.params['jaxpr'], *invals, *allocs,
+                             compiler_params=compiler_params)
+
+      # TODO(jburnim): De-allocate.
+      # for a in allocs:
+      #   if isinstance(a, tuple):
+      #     callback.io_callback(
+      #       _deallocate_buffer,
+      #       None,
+      #       device_coords,
+      #       TPU_MEMORY_SPACE_IDXS[v.aval.memory_space],
+      #       a,
+      #       ordered=True)
+      #   else:
+      #     callback.io_callback(
+      #       _deallocate_semaphore,
+      #       None,
+      #       device_coords,
+      #       a,
+      #       ordered=True)
 
     elif prim is state_primitives.get_p:
       out = callback.io_callback(
@@ -339,8 +434,8 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params):
     elif prim is mosaic_primitives.dma_start_p:
       (src, src_transforms,
        dst, dst_transforms,
-       src_sem, src_sem_transforms,
        dst_sem, dst_sem_transforms,
+       src_sem, src_sem_transforms,
        device_id) = jax.tree.unflatten(eqn.params['tree'], invals)
       (orig_src_ref, _, orig_dst_ref, *_
        ) = jax.tree.unflatten(eqn.params['tree'], eqn.invars)
@@ -361,11 +456,11 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params):
     elif prim is mosaic_primitives.dma_wait_p:
       (src, src_transforms,
        dst, dst_transforms,
-       src_sem, src_sem_transforms,
        dst_sem, dst_sem_transforms,
+       src_sem, src_sem_transforms,
        device_id) = jax.tree.unflatten(eqn.params['tree'], invals)
       read_shape, read_dtype = _compute_transformed_shape_and_dtype(
-        invals[0].aval.shape, invals[0].aval.dtype, src_transforms)
+        eqn.invars[0].aval.shape, eqn.invars[0].aval.dtype, src_transforms)
       callback.io_callback(
         dma_wait,
         (),
@@ -415,6 +510,8 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params):
     out = out if prim.multiple_results else [out]
     jax.util.safe_map(write, eqn.outvars, out)
 
+  return jax.util.safe_map(read, jaxpr.outvars)
+
 def _initialize_scratch_vals(scratch_avals) -> tuple[jax.Array, ...]:
   scratch_avals = (jax_core.raise_to_shaped(x) for x in scratch_avals)
   return tuple(
@@ -435,6 +532,27 @@ def _initialize_output_vals(
           bm.array_shape_dtype.dtype))
   return output_vals
 
+def _compute_start_indices(block_mapping, loop_idx, *args):
+    block_indices = (
+      jax_core.jaxpr_as_fun(block_mapping.index_map_jaxpr)(*loop_idx, *args))
+    if isinstance(block_mapping.indexing_mode, pallas_core.Blocked):
+      ret = tuple(i if b is pallas_core.mapped else b * i
+                  for b, i in zip(block_mapping.block_shape, block_indices))
+    elif isinstance(block_mapping.indexing_mode, pallas_core.Unblocked):
+      ret = block_indices
+    else:
+      raise RuntimeError(f"Unknown indexing mode: {block_mapping.indexing_mode}")
+    return ret
+
+def _get_next_indices(grid, indices):
+  next_indices = []
+  carry = True
+  for dim_size, index in reversed(list(zip(grid, indices))):
+    i = jnp.where(carry, index + 1, index)
+    carry = dim_size == i
+    next_indices.append(jnp.where(carry, 0, i))
+  return tuple(reversed(next_indices))
+
 def interpret_pallas_call(
     *args,
     jaxpr: jax_core.Jaxpr,
@@ -448,9 +566,16 @@ def interpret_pallas_call(
 ):
   del debug, cost_estimate, out_avals
 
-  # TODO(jburnim): Handle non-trivial grids, different blocking modes,
-  # padding, etc.
-  assert grid_mapping.grid == ()
+  dynamic_grid_args, args = split_list(  # type: ignore
+      args, [grid_mapping.num_dynamic_grid_bounds]
+  )
+  dynamic_grid_args_iter = iter(dynamic_grid_args)
+  grid = tuple(
+      a if a is not pallas_core.dynamic_grid_dim
+      else next(dynamic_grid_args_iter)
+      for a in grid_mapping.grid
+  )
+  assert next(dynamic_grid_args_iter, None) is None
 
   scalars = args[grid_mapping.slice_index_ops]
   out = _initialize_output_vals(
@@ -469,9 +594,11 @@ def interpret_pallas_call(
   # Allocate and fill buffers for all block arguments, outputs,
   # and scratch values.
   # TODO(jburnim): Handle aliasing.
+  # TODO(jburnim): Handle padding.
+  in_out_args = list(block_args) + list(out)
   buffer_ids = []
   for var, value in zip(jaxpr.invars[grid_mapping.num_index_operands:],
-                        itertools.chain(block_args, out, scratch_values)):
+                        itertools.chain(in_out_args, scratch_values)):
     if var.aval.memory_space.value == 'semaphore_mem':
       buffer_ids.append(callback.io_callback(
         _allocate_semaphore,
@@ -480,19 +607,73 @@ def interpret_pallas_call(
         var.aval.shape,
         ordered=True))
     else:
-      buffer_ids.append(callback.io_callback(
+      buffer_ids.append((callback.io_callback(
         _allocate_buffer,
         jax.ShapeDtypeStruct((), jnp.int16),
         device_coords,
         TPU_MEMORY_SPACE_IDXS[var.aval.memory_space],
         value,
-        ordered=True))
+        ordered=True), ()))
+  in_out_ids, scratch_ids = split_list(
+    buffer_ids, [grid_mapping.num_inputs + grid_mapping.num_outputs])
 
-  # Run the kernel for the single grid element.
-  _interpret_jaxpr(jaxpr, *scalars, *buffer_ids,
-                   compiler_params=compiler_params)
+  is_indexing_dim = [
+      tuple(b is pallas_core.mapped for b in bm.block_shape)
+      for bm in grid_mapping.block_mappings
+  ]
+  block_shapes = [
+      tuple(1 if i else b for i, b in zip(iid, bm.block_shape))
+      for iid, bm in zip(is_indexing_dim, grid_mapping.block_mappings)
+  ]
 
-  # TODO(jburnim): Read the output from the allocated output buffers.
+  if grid:
+    num_iterations = reduce(jnp.multiply, grid)  # type: ignore[arg-type]
+  else:
+    # Base case is always one iteration when grid is ()
+    num_iterations = 1
+
+  def body(carry):
+    # The loop carry: (i, loop_idx) --
+    #  - i:int32 is the interation index
+    #  - loop_idx: tuple[int32] are the program ids for each grid axis
+    i, loop_idx = carry
+
+    if grid_mapping.local_grid_env is not None:
+      local_grid_env = grid_mapping.local_grid_env(loop_idx, grid)
+    else:
+      local_grid_env = tuple(
+          pallas_core.GridAxis(idx, b)
+          for dim, (idx, b) in enumerate(zip(loop_idx, grid))
+          if dim not in grid_mapping.vmapped_dims
+      )
+
+    with pallas_core.grid_env(local_grid_env):
+      start_indices = [_compute_start_indices(bm, loop_idx, *scalars)
+                       for bm in grid_mapping.block_mappings]
+      transformed_in_out_ids = []
+      for start_idx, block_shape, arg_id, arg, is_indexing in zip(
+          start_indices, block_shapes, in_out_ids, in_out_args, is_indexing_dim):
+        assert all(is_indexing_dim)  # TODO(jburnim): Handle non-indexing dims.
+        transformed_in_out_ids.append((
+          arg_id[0],
+          (indexing.NDIndexer(
+            indices=tuple(indexing.ds(i, s) for i, s in zip(start_idx, block_shape)),
+            shape=arg.aval.shape,
+            int_indexer_shape=()),)
+        ))
+      _interpret_jaxpr(jaxpr, *scalars, *transformed_in_out_ids, *scratch_ids,
+                       compiler_params=compiler_params)
+
+      return i + 1, _get_next_indices(grid, loop_idx)
+
+  # TODO(jburnim): Handle parallel grid dimensions + megacore.
+  _ = lax.while_loop(
+    lambda carry: carry[0] < num_iterations,
+    body,
+    (jnp.int32(0), (jnp.int32(0),) * len(grid))
+  )
+
+  # Read the output from the allocated output buffers.
   out_buffer_ids = buffer_ids[len(block_args):len(block_args) + len(out)]
   out_invars = (
       jaxpr.invars[grid_mapping.slice_block_ops][-grid_mapping.num_outputs:])
@@ -507,5 +688,7 @@ def interpret_pallas_call(
         ordered=True)
     for var, out_buffer_id in zip(out_invars, out_buffer_ids)
   ]
+
+  # TODO(jburnim): De-allocate buffers and semaphores.
 
   return out_out
