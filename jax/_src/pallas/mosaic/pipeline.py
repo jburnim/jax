@@ -75,6 +75,7 @@ def _broadcast_pytree_to(from_pytree, to_pytree):
 
 @jax_util.cache(trace_context_in_key=False)
 def _get_tpu_generation() -> int:
+  return 5
   kind = jax.devices()[0].device_kind
   if kind.endswith(' lite'):
     kind = kind[:-len(' lite')]
@@ -839,7 +840,7 @@ def skip_input_copies_when_init_accumulators(schedule) -> Any:
     def new_pred(original_pred_fn, *a):
       pred = original_pred_fn(*a)
       if a[1].is_accumulator or a[1].is_input_output:
-        pred &= ~a[0].init_accumulators
+        pred &= ~jnp.asarray(a[0].init_accumulators)
       return pred
 
     new_schedule[k] = functools.partial(
