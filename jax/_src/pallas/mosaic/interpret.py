@@ -15,6 +15,7 @@
 import collections
 from collections.abc import Iterable, Sequence
 import dataclasses
+from functools import reduce
 import itertools
 import math
 import threading
@@ -156,6 +157,8 @@ def transform_array(x, transforms):
   return x
 
 def get(device_id, memory_space, buffer_id, transforms):
+  buffer_id, transforms = buffer_id[0], buffer_id[1] + transforms
+
   device_id = tuple(int(x) for x in device_id)
   memory_space = TPU_MEMORY_SPACE_NAMES[int(memory_space)]
   buffer_id = int(buffer_id)
@@ -166,6 +169,8 @@ def get(device_id, memory_space, buffer_id, transforms):
     ).copy()
 
 def store(device_id, memory_space, buffer_id, transforms, val):
+  buffer_id, transforms = buffer_id[0], buffer_id[1] + transforms
+
   device_id = tuple(int(x) for x in device_id)
   memory_space = TPU_MEMORY_SPACE_NAMES[int(memory_space)]
   buffer_id = int(buffer_id)
@@ -180,6 +185,8 @@ def store(device_id, memory_space, buffer_id, transforms, val):
       shared_memory.mem[(memory_space, buffer_id, device_id)] = val
 
 def swap(device_id, memory_space, buffer_id, transforms, val):
+  buffer_id, transforms = buffer_id[0], buffer_id[1] + transforms
+
   device_id = tuple(int(x) for x in device_id)
   memory_space = TPU_MEMORY_SPACE_NAMES[int(memory_space)]
   buffer_id = int(buffer_id)
@@ -222,14 +229,21 @@ def dma_start(device_id, src_memory_space, src_id, src_transforms,
               dst_sem,
               src_sem,
               dst_device_id):
+  src_id, src_transforms = src_id[0], src_id[1] + src_transforms
+  dst_id, dst_transforms = dst_id[0], dst_id[1] + dst_transforms
+
   device_id = tuple(int(x) for x in device_id)
   src_memory_space, src_id = int(src_memory_space), int(src_id)
   src_transforms = jax.tree.map(int, src_transforms)
   dst_memory_space, dst_id = int(dst_memory_space), int(dst_id)
   dst_transforms = jax.tree.map(int, dst_transforms)
   dst_sem = int(dst_sem)
-  src_sem = int(src_sem)
-  dst_device_id = tuple(int(x) for x in dst_device_id)
+  if src_sem is not None:
+    src_sem = int(src_sem)
+  if dst_device_id is not None:
+    dst_device_id = tuple(int(x) for x in dst_device_id)
+  else:
+    dst_device_id = device_id
 
   with shared_memory.lock:
     dst_sem = shared_memory.sem[dst_sem]
@@ -239,8 +253,8 @@ def dma_start(device_id, src_memory_space, src_id, src_transforms,
   # For now, just execute the DMA immediately.
   # TODO(jburnim): Execute DMAs asynchronously.
   execute_dma(
-      (device_id, src_memory_space, src_id, src_transforms),
-      (dst_device_id, dst_memory_space, dst_id, dst_transforms),
+      (device_id, src_memory_space, (src_id, ()), src_transforms),
+      (dst_device_id, dst_memory_space, (dst_id, ()), dst_transforms),
       src_sem,
       dst_sem)
 
@@ -370,8 +384,8 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params):
     elif prim is mosaic_primitives.dma_start_p:
       (src, src_transforms,
        dst, dst_transforms,
-       src_sem, src_sem_transforms,
        dst_sem, dst_sem_transforms,
+       src_sem, src_sem_transforms,
        device_id) = jax.tree.unflatten(eqn.params['tree'], invals)
       (orig_src_ref, _, orig_dst_ref, *_
        ) = jax.tree.unflatten(eqn.params['tree'], eqn.invars)
@@ -392,11 +406,11 @@ def _interpret_jaxpr(jaxpr, *args, compiler_params):
     elif prim is mosaic_primitives.dma_wait_p:
       (src, src_transforms,
        dst, dst_transforms,
-       src_sem, src_sem_transforms,
        dst_sem, dst_sem_transforms,
+       src_sem, src_sem_transforms,
        device_id) = jax.tree.unflatten(eqn.params['tree'], invals)
       read_shape, read_dtype = _compute_transformed_shape_and_dtype(
-        invals[0].aval.shape, invals[0].aval.dtype, src_transforms)
+        invals[0][0].aval.shape, invals[0][0].aval.dtype, src_transforms)
       callback.io_callback(
         dma_wait,
         (),
@@ -481,9 +495,21 @@ def interpret_pallas_call(
 ):
   del debug, cost_estimate, out_avals
 
+  dynamic_grid_args, args = split_list(  # type: ignore
+      args, [grid_mapping.num_dynamic_grid_bounds]
+  )
+  dynamic_grid_args_iter = iter(dynamic_grid_args)
+  grid = tuple(
+      a if a is not pallas_core.dynamic_grid_dim
+      else next(dynamic_grid_args_iter)
+      for a in grid_mapping.grid
+  )
+  assert next(dynamic_grid_args_iter, None) is None
+
   # TODO(jburnim): Handle non-trivial grids, different blocking modes,
   # padding, etc.
-  assert grid_mapping.grid == ()
+  # print(grid_mapping)
+  # assert grid_mapping.grid == ()
 
   scalars = args[grid_mapping.slice_index_ops]
   out = _initialize_output_vals(
@@ -513,17 +539,30 @@ def interpret_pallas_call(
         var.aval.shape,
         ordered=True))
     else:
-      buffer_ids.append(callback.io_callback(
+      buffer_ids.append((callback.io_callback(
         _allocate_buffer,
         jax.ShapeDtypeStruct((), jnp.int16),
         device_coords,
         TPU_MEMORY_SPACE_IDXS[var.aval.memory_space],
         value,
-        ordered=True))
+        ordered=True), ()))
 
-  # Run the kernel for the single grid element.
-  _interpret_jaxpr(jaxpr, *scalars, *buffer_ids,
-                   compiler_params=compiler_params)
+  if grid:
+    num_iterations = reduce(jnp.multiply, grid)  # type: ignore[arg-type]
+  else:
+    # Base case is always one iteration when grid is ()
+    num_iterations = 1
+
+  def _body(i, _):
+    # TODO(jburnim): Compute this correctly.
+    local_grid_env = tuple(pallas_core.GridAxis(i, b) for b in grid)
+    with pallas_core.grid_env(local_grid_env):
+      # TODO(jburnim): Slice the inputs.
+      _interpret_jaxpr(jaxpr, *scalars, *buffer_ids,
+                       compiler_params=compiler_params)
+      return ()
+  # TODO(jburnim): Handle parallel grid dimensions.
+  _ = lax.fori_loop(0, num_iterations, _body, ())
 
   # TODO(jburnim): Read the output from the allocated output buffers.
   out_buffer_ids = buffer_ids[len(block_args):len(block_args) + len(out)]
