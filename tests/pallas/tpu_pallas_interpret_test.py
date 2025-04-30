@@ -19,6 +19,7 @@ contains only tests that do not use shard_map.
 """
 
 import functools
+import time
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -367,7 +368,7 @@ class InterpretTest(jtu.JaxTestCase):
               random_seed=12345, grid_point_recorder=grid_point_recorder
           ),
           compiler_params=pltpu.TPUCompilerParams(
-              dimension_semantics=('arbitrary', 'parallel')
+              dimension_semantics=(pltpu.ARBITRARY, pltpu.PARALLEL)
           ),
       )(s)
 
@@ -420,7 +421,7 @@ class InterpretTest(jtu.JaxTestCase):
               random_seed=12345, grid_point_recorder=grid_point_recorder
           ),
           compiler_params=pltpu.TPUCompilerParams(
-              dimension_semantics=('parallel', 'arbitrary')
+              dimension_semantics=(pltpu.PARALLEL, pltpu.ARBITRARY)
           ),
       )(s)
 
@@ -479,7 +480,7 @@ class InterpretTest(jtu.JaxTestCase):
           out_specs=pl.BlockSpec((1,), lambda _: (0,)),
           interpret=mosaic_interpret.TPUInterpretParams(),
           compiler_params=pltpu.TPUCompilerParams(
-              dimension_semantics=('parallel',)
+              dimension_semantics=(pltpu.PARALLEL,)
           ),
       )()
 
@@ -521,6 +522,68 @@ class InterpretTest(jtu.JaxTestCase):
     y = f(x)
     np.testing.assert_array_equal(y, x + 1)
 
+  def test_thread_map(self):
+    def _sleep():
+      time.sleep(2)
+
+    def f(core_index):
+      jax.debug.print('core_index: {t}', t=core_index)
+      jax.experimental.io_callback(_sleep, (), ordered=True)
+      jax.debug.print('core_index: {t}', t=core_index)
+
+    mosaic_interpret._thread_map(f, 'core', 8)
+
+  def test_core_map_over_two_cores(self):
+    self.skipTest('Megacore support not yet working')
+    num_cores = 2
+    mesh = pltpu.create_tensorcore_mesh("x", num_cores=num_cores)
+
+    @jax.jit
+    def f(x):
+      y = jnp.zeros_like(x)
+      def inner(refs):
+        x_ref, y_ref = refs
+        @pl.core_map(mesh, interpret=mosaic_interpret.TPUInterpretParams())
+        def _():
+          num_cores = jax.lax.psum(1, "x")
+          slc_size = 16 // num_cores
+          def alloc(x_vmem_ref, y_vmem_ref, dma_sem, sem):
+            core_index = jax.lax.axis_index("x")
+            slc = pl.ds(core_index * slc_size, slc_size)
+            pltpu.async_copy(
+                x_ref.at[slc],
+                x_vmem_ref,
+                dma_sem,
+            ).wait()
+            y = x_vmem_ref[...] + jax.lax.axis_index("x")
+            y_vmem_ref[...] = y
+            pltpu.async_copy(y_vmem_ref, y_ref.at[slc], dma_sem).wait()
+            jax.debug.print('core_index: {t}', t=core_index)
+            if True:
+              jax.lax.cond(
+                  core_index == 0,
+                  lambda: pltpu.semaphore_wait(sem, 1),
+                  lambda: pltpu.semaphore_signal(sem, 1, core_index=0))
+            jax.debug.print('core_index: {t}', t=core_index)
+          pl.run_scoped(
+              alloc,
+              pltpu.VMEM((slc_size, 128), x_ref.dtype),
+              pltpu.VMEM((slc_size, 128), y_ref.dtype),
+              pltpu.SemaphoreType.DMA,
+              pltpu.SemaphoreType.REGULAR,
+          )
+      _, y = pl.run_state(inner)((x, y))
+      return y
+    x = jnp.arange(16 * 128, dtype=jnp.int32).reshape((16, 128))
+    y = f(x)
+    expected_out = (
+        x.reshape((num_cores, -1, 128)) + jnp.arange(num_cores)[..., None, None]
+    ).reshape(x.shape)
+    np.testing.assert_array_equal(y, expected_out)
+
 
 if __name__ == '__main__':
+  # import os
+  # os.environ['PJRT_NPROC'] = '16'
+  # os.environ['NPROC'] = '16'
   absltest.main(testLoader=jtu.JaxTestLoader())
