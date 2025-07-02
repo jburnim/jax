@@ -67,7 +67,7 @@ ScratchShapeTree = pallas_core.ScratchShapeTree
 CostEstimate = pallas_core.CostEstimate
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True)
 class InterpretParams:
   """Parameters for Mosaic TPU interpret mode.
 
@@ -110,6 +110,8 @@ class InterpretParams:
   """
   dma_execution_mode: Literal["eager", "on_wait"] = "on_wait"
   detect_races: bool = False
+  on_race: Literal["raise_at_end", "raise", "log"] = "raise_at_end"
+  out_of_bounds_reads: Literal["raise", "uninitialized"] = "raise"
   skip_floating_point_ops: bool = False
   uninitialized_memory: Literal["nan", "zero"] = "nan"
   random_seed: int | None = None
@@ -933,7 +935,25 @@ def get(
     buffer = shared_memory.mem[
         (memory_space, buffer_id, device_id, local_core_id_for_buffer)
     ]
-    ret = buffer[read_range].copy()
+    try:
+      ret = buffer[read_range].copy()
+    except:
+      if shared_memory.interpret_params.out_of_bounds_reads == "raise":
+        with source_info_util.user_context(traceback=source_info.traceback,
+                                           name_stack=source_info.name_stack):
+          raise IndexError(
+              'Out-of-bounds read of'
+              f' ({device_id} {local_core_id} {memory_space} {buffer_id}):'
+              f' reading [{read_range}] but buffer has shape {buffer.shape}.'
+          ) from None
+      # out_of_bounds_reads == "uninitialized"
+      if transforms:
+        expected_shape = transforms[-1].get_indexer_shape()
+      else:
+        expected_shape = buffer.shape
+      ret = _uninitialized_value(
+          expected_shape, buffer.dtype, shared_memory.interpret_params)
+
     if transforms:
       # TODO(jburnim): Instead of using NDIndexer, do the computation ourselves
       # with buffer.shape and read_range?
@@ -1915,7 +1935,7 @@ def _uninitialized_value(shape, dtype, interpret_params):
     elif jnp.issubdtype(dtype, jnp.integer):
       return jnp.full(shape, jnp.iinfo(dtype).max, dtype)
     elif jnp.issubdtype(dtype, jnp.bool):
-      return jnp.full(shape, False, dtype)
+      return jnp.full(shape, True, dtype)
   if interpret_params.uninitialized_memory == 'zero':
     return jnp.full(shape, 0, dtype)
   raise NotImplementedError(
